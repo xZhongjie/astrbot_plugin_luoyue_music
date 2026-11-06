@@ -18,6 +18,7 @@
 - 🎚 **音质可调**：网易云 1-2、QQ 音乐 0-16 级音质
 - 🧩 **开箱即用**：无需申请 Token，安装后在 WebUI 配置即可使用
 - 🔁 **跨音源兜底**：当前音源取不到播放链接时，自动走免费线路或切换另一音源
+- 🔌 **自建 Meting 接口**：可接自己的会员解析服务，VIP 歌不必再切 QQ
 - 🛡 **稳健处理**：接口超时重试、异常兜底、并发锁、候选缓存自动清理
 
 ## 📦 安装
@@ -128,6 +129,7 @@ Bot：[文件]
 | `auto_play_single` | bool | `true` | 只命中一首时直接播放 |
 | `auto_source_fallback` | bool | `true` | 取不到播放链接时自动到另一音源搜索同名歌曲 |
 | `netease_outer_fallback` | bool | `true` | 网易云优先使用官方标准音质免费线路（128k） |
+| `meting_api` | string | 空 | 可选的自建 Meting / 解析接口模板，支持 `{source}`、`{id}`、`{mid}`、`{quality}` 等占位符 |
 | `voice_max_seconds` | int | `60` | 单段语音最长时长（秒），超出后自动分片，0 表示不分片 |
 | `voice_split` | bool | `true` | 是否启用语音自动分片；关闭后超长歌曲改发音频文件 |
 | `selection_ttl` | int | `120` | 候选有效期（秒） |
@@ -152,6 +154,21 @@ Bot：[文件]
 | `file` | 以音频文件发送 | 支持文件消息的平台 |
 
 > `record` 模式会在 AstrBot 所在机器下载音频并转码为 wav，请确保已安装 `ffmpeg`，且音频时长不要过长。
+
+### 自定义 Meting / 解析接口
+
+如果你自建了 [Meting API](https://github.com/metowolf/Meting)（并在服务端配置了自己的网易云 / QQ 会员 Cookie），可以在插件配置里填写 `meting_api`：
+
+```text
+https://your-meting.example.com/api?server={source}&type=url&id={id}&br={quality}
+```
+
+- 支持占位符：`{source}`、`{id}`、`{mid}`、`{quality}`、`{title}`、`{singer}`
+- 插件会在落月 / 免费线路都取不到链接时调用该接口，成功则使用它返回的音频，**不再切 QQ 音乐**
+- 接口可以返回纯文本 URL，也可以返回 `{"url": "..."}` 或 `{"data": {"url": "..."}}`
+- 公共 Meting 实例通常没有会员 Cookie，VIP 歌仍会返回空；需要自建并配置你自己的 Cookie
+
+> 该接口由你自行提供，请确保你有权使用对应账号和服务；插件不内置任何第三方解析地址。
 
 ## ❓ 常见问题
 

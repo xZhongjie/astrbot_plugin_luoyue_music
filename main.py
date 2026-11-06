@@ -484,6 +484,22 @@ class LuoyueClient:
         except (TimeoutError, aiohttp.ClientError) as exc:
             raise LuoyueError(f"音频下载失败：{exc}") from exc
 
+    async def fetch_text(self, url: str) -> str:
+        """请求文本接口（用于 Meting 等自定义解析服务）。"""
+        session = await self._get_session()
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        try:
+            async with session.get(
+                url,
+                proxy=self.proxy or None,
+                timeout=timeout,
+            ) as response:
+                if response.status != 200:
+                    raise LuoyueError(f"Meting 接口返回 HTTP {response.status}")
+                return await response.text()
+        except (TimeoutError, aiohttp.ClientError) as exc:
+            raise LuoyueError(f"Meting 请求失败：{exc}") from exc
+
 
 def _build_music_card(song: Song, audio_url: str, force_custom: bool = False):
     """构造 OneBot 音乐卡片组件。
@@ -950,9 +966,7 @@ class LuoyueMusicPlugin(Star):
         )
         return [
             Comp.Plain(
-                format_search_result(
-                    source, keyword, songs, self._ttl(), mode, quality
-                )
+                format_search_result(source, keyword, songs, self._ttl(), mode, quality)
             )
         ]
 
@@ -1040,6 +1054,17 @@ class LuoyueMusicPlugin(Star):
 
         返回 ``(消息组件, 是否成功)``。
         """
+        # 可选：用户自建的 Meting / 解析接口（落月拿不到链接时优先尝试）
+        meting = await self._try_meting(song)
+        if meting is not None:
+            note = "🎧 已使用 Meting 解析接口获取播放链接。\n"
+            components = await self._maybe_send_split_voice(
+                event, song, meting, mode, note
+            )
+            if components is not None:
+                return components, True
+            return self._build_play_chain(event, song, meting, mode, note), True
+
         if not self._auto_source_fallback():
             return self._play_error_chain(song, error), False
 
@@ -1146,6 +1171,62 @@ class LuoyueMusicPlugin(Star):
         )
         return [Comp.Plain("\n".join(lines))]
 
+    async def _try_meting(self, song: Song) -> dict | None:
+        """调用用户配置的 Meting 接口，成功时返回播放信息。"""
+        template = str(_config_value(self.config, "meting_api", "")).strip()
+        if not template:
+            return None
+
+        try:
+            url = template.format(
+                source=song.source,
+                id=song.song_id,
+                mid=song.mid or song.song_id,
+                quality=self._quality(song.source),
+                title=song.title,
+                singer=song.singer,
+            )
+        except (KeyError, ValueError):
+            logger.warning("meting_api 模板占位符不正确")
+            return None
+
+        try:
+            text = (await self.client.fetch_text(url)).strip()
+        except LuoyueError as exc:
+            logger.warning("Meting 请求失败：%s", exc)
+            return None
+
+        audio_url = ""
+        try:
+            data = json.loads(text)
+        except ValueError:
+            if text.startswith(("http://", "https://")):
+                audio_url = text
+        else:
+            if isinstance(data, dict):
+                value = data.get("url")
+                if not value:
+                    value = data.get("data")
+                    if isinstance(value, dict):
+                        value = value.get("url")
+                if isinstance(value, str):
+                    audio_url = value.strip()
+
+        if not audio_url:
+            logger.warning("Meting 接口没有返回播放链接")
+            return None
+        if not await self.client._probe_audio(audio_url):
+            logger.warning("Meting 返回的链接不是有效音频")
+            return None
+
+        return {
+            "url": audio_url,
+            "quality": "Meting 解析",
+            "interval": song.duration,
+            "size": song.size,
+            "link": self._web_link(song),
+        }
+
     async def _maybe_send_split_voice(
         self,
         event: AstrMessageEvent,
@@ -1175,9 +1256,7 @@ class LuoyueMusicPlugin(Star):
             return None
 
         try:
-            return await self._send_split_voice(
-                event, song, play, limit, extra_note
-            )
+            return await self._send_split_voice(event, song, play, limit, extra_note)
         except Exception:  # noqa: BLE001 - 分片失败时退回文件发送
             logger.exception("语音分片失败，改用音频文件发送")
             play["_voice_split_failed"] = True

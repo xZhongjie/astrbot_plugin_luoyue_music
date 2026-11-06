@@ -72,6 +72,12 @@
     "default": true,
     "hint": "网易云点歌时优先使用官方 song/media/outer 标准音质免费线路（128k），免费歌曲可直接播放，不会再去请求高音质或切换 QQ 音乐。"
   },
+  "meting_api": {
+    "description": "Meting / 自定义解析接口",
+    "type": "string",
+    "default": "",
+    "hint": "可选。填入自建 Meting API 模板，例如 https://your-meting.example.com/api?server={source}&type=url&id={id}。支持占位符 {source}、{id}、{mid}、{quality}、{title}、{singer}。公共 Meting 实例通常没有会员 Cookie，VIP 歌会返回空；需要自建并配置你自己的 Cookie。"
+  },
   "voice_max_seconds": {
     "description": "单段语音最长时长（秒）",
     "type": "int",
