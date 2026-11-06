@@ -874,17 +874,32 @@ class LuoyueMusicPlugin(Star):
             return self._play_error_chain(song, error), False
 
         other = "tencent" if song.source == "netease" else "netease"
-        keyword = f"{song.title} {song.singer}".strip()
+
+        # 不同音源对关键词的容忍度不同：先试“歌名 歌手”，再试“歌名+歌手”，
+        # 最后退回只搜歌名。上游对空格的处理偶尔不稳定，多试几种更可靠。
+        keywords: list[str] = []
+        for value in (
+            f"{song.title} {song.singer}".strip(),
+            f"{song.title}+{song.singer}".strip("+ "),
+            song.title.strip(),
+        ):
+            if value and value not in keywords:
+                keywords.append(value)
+
         candidates: list[Song] = []
-        try:
-            candidates = await self.client.search(
-                other,
-                keyword,
-                self._limit(),
-                self._quality(other),
-            )
-        except Exception:  # noqa: BLE001 - 兜底流程失败时退回错误提示
-            logger.warning("跨音源搜索失败：%s %s", other, keyword)
+        for keyword in keywords:
+            try:
+                candidates = await self.client.search(
+                    other,
+                    keyword,
+                    self._limit(),
+                    self._quality(other),
+                )
+            except Exception:  # noqa: BLE001 - 兜底流程失败时继续尝试下一种关键词
+                logger.warning("跨音源搜索失败：%s %s", other, keyword)
+                continue
+            if candidates:
+                break
 
         candidate = self._pick_similar(song, candidates)
         if candidate is not None:
