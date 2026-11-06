@@ -76,6 +76,12 @@ MODE_LABELS = {
     "file": "文件",
 }
 
+# 网易云免费可用的音质标签（搜索结果里的 quality 是歌曲最高音质，不是实际播放音质）
+FREE_QUALITY_LABELS = {
+    1: "64k",
+    2: "128k",
+}
+
 HELP_TEXT = """🎵 落月点歌 使用说明
 
 /点歌 歌名 —— 搜索歌曲并列出候选
@@ -555,12 +561,17 @@ def format_search_result(
     songs: list[Song],
     ttl: int,
     mode: str | None = None,
+    quality: int | None = None,
 ) -> str:
     lines = [
         f"🎵 落月点歌 · {SOURCE_LABELS.get(source, source)}",
         f"🔍 搜索：{keyword}（共 {len(songs)} 首）",
-        "",
     ]
+    if source == "netease":
+        label = FREE_QUALITY_LABELS.get(quality or 2, "128k")
+        lines.append(f"🎚 播放音质：{label}（免费线路）")
+    lines.append("")
+
     for index, song in enumerate(songs, 1):
         head = f"{index}. {song.title}"
         if song.singer:
@@ -570,7 +581,8 @@ def format_search_result(
         meta: list[str] = []
         if song.album:
             meta.append(f"《{song.album}》")
-        if song.quality:
+        # 网易云的 quality 字段是歌曲最高音质，容易误解为实际播放音质，不展示
+        if source != "netease" and song.quality:
             meta.append(song.quality)
         if song.pay and song.pay not in {"免费", "0", ""}:
             meta.append(song.pay)
@@ -906,6 +918,7 @@ class LuoyueMusicPlugin(Star):
         mode: str | None = None,
     ) -> list:
         source = await self._get_source(event)
+        quality = self._quality(source)
         self._prune_sessions()
 
         try:
@@ -913,7 +926,7 @@ class LuoyueMusicPlugin(Star):
                 source,
                 keyword,
                 self._limit(),
-                self._quality(source),
+                quality,
             )
         except LuoyueError as exc:
             logger.warning("搜索歌曲失败：%s", exc)
@@ -936,7 +949,11 @@ class LuoyueMusicPlugin(Star):
             mode=mode,
         )
         return [
-            Comp.Plain(format_search_result(source, keyword, songs, self._ttl(), mode))
+            Comp.Plain(
+                format_search_result(
+                    source, keyword, songs, self._ttl(), mode, quality
+                )
+            )
         ]
 
     async def _select_song(
