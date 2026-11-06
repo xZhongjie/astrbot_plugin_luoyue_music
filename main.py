@@ -30,6 +30,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 
 PLUGIN_NAME = "astrbot_plugin_luoyue_music"
+PLUGIN_VERSION = "v1.3.2"
 DEFAULT_API_BASE = "https://api.vkeys.cn"
 
 SOURCE_LABELS = {
@@ -650,8 +651,9 @@ class LuoyueMusicPlugin(Star):
         self._source_cache: dict[str, str] = {}
         self._outer_blocked_until = 0.0
         logger.info(
-            "落月点歌插件已加载，注册指令：点歌 / 选歌 / 直接点歌 / "
-            "语音点歌 / 文件点歌 / 点歌源 / 点歌帮助"
+            "落月点歌插件 %s 已加载，注册指令：点歌 / 选歌 / 直接点歌 / "
+            "语音点歌 / 文件点歌 / 点歌源 / 点歌帮助",
+            PLUGIN_VERSION,
         )
 
     async def terminate(self):
@@ -1010,12 +1012,7 @@ class LuoyueMusicPlugin(Star):
                 outer = await self.client.netease_outer(song)
                 if outer:
                     self._sessions.pop(key, None)
-                    components = await self._maybe_send_split_voice(
-                        event, song, outer, mode
-                    )
-                    if components is not None:
-                        return components
-                    return self._build_play_chain(
+                    return await self._finalize_play(
                         event,
                         song,
                         outer,
@@ -1038,10 +1035,7 @@ class LuoyueMusicPlugin(Star):
                 return [Comp.Plain("❌ 播放失败：插件内部错误，请查看 AstrBot 日志。")]
 
             self._sessions.pop(key, None)
-            components = await self._maybe_send_split_voice(event, song, play, mode)
-            if components is not None:
-                return components
-            return self._build_play_chain(event, song, play, mode)
+            return await self._finalize_play(event, song, play, mode)
 
     async def _fallback_play(
         self,
@@ -1058,12 +1052,7 @@ class LuoyueMusicPlugin(Star):
         meting = await self._try_meting(song)
         if meting is not None:
             note = "🎧 已使用 Meting 解析接口获取播放链接。\n"
-            components = await self._maybe_send_split_voice(
-                event, song, meting, mode, note
-            )
-            if components is not None:
-                return components, True
-            return self._build_play_chain(event, song, meting, mode, note), True
+            return await self._finalize_play(event, song, meting, mode, note), True
 
         if not self._auto_source_fallback():
             return self._play_error_chain(song, error), False
@@ -1109,15 +1098,10 @@ class LuoyueMusicPlugin(Star):
                     f"🔁 {SOURCE_LABELS[song.source]}暂无可用播放链接，"
                     f"已自动切换到 {SOURCE_LABELS[other]}。\n"
                 )
-                components = await self._maybe_send_split_voice(
+                components = await self._finalize_play(
                     event, candidate, play, mode, note
                 )
-                if components is not None:
-                    return components, True
-                return (
-                    self._build_play_chain(event, candidate, play, mode, note),
-                    True,
-                )
+                return components, True
 
         return self._play_error_chain(song, error), False
 
@@ -1237,6 +1221,71 @@ class LuoyueMusicPlugin(Star):
             "link": self._web_link(song),
         }
 
+    async def _finalize_play(
+        self,
+        event: AstrMessageEvent,
+        song: Song,
+        play: dict,
+        mode: str | None = None,
+        extra_note: str = "",
+    ) -> list:
+        """按发送方式完成发送：优先分片语音，其次单段语音，最后文件/链接。"""
+        components = await self._maybe_send_split_voice(
+            event, song, play, mode, extra_note
+        )
+        if components is not None:
+            return components
+
+        if self._send_mode(event, mode) == "record":
+            sent = await self._try_send_single_voice(
+                event, song, play, extra_note
+            )
+            if sent:
+                return []
+
+        return self._build_play_chain(event, song, play, mode, extra_note)
+
+    async def _try_send_single_voice(
+        self,
+        event: AstrMessageEvent,
+        song: Song,
+        play: dict,
+        extra_note: str = "",
+    ) -> bool:
+        """分片不可用时，尝试把整首歌作为一条语音发送（QQ 试听通常只有几十秒）。"""
+        if not self._voice_split():
+            return False
+        if shutil.which("ffmpeg") is None:
+            return False
+
+        audio_url = str(play.get("url") or "").strip()
+        if not audio_url:
+            return False
+
+        limit = self._voice_max_seconds()
+        seconds = _parse_duration(str(play.get("interval") or song.duration or ""))
+        need_single = play.get("_voice_split_failed") or (
+            limit > 0 and seconds is not None and seconds > limit
+        )
+        if not need_single:
+            return False
+
+        header = (
+            extra_note
+            + format_play_info(song, play)
+            + "\n🎤 已按单段语音发送。"
+        )
+        try:
+            await event.send(
+                event.chain_result(
+                    [Comp.Plain(header), Comp.Record(file=audio_url, url=audio_url)]
+                )
+            )
+            return True
+        except Exception:  # noqa: BLE001 - 单段语音失败时改发文件
+            logger.exception("单段语音发送失败，改用音频文件")
+            return False
+
     async def _maybe_send_split_voice(
         self,
         event: AstrMessageEvent,
@@ -1267,9 +1316,10 @@ class LuoyueMusicPlugin(Star):
 
         try:
             return await self._send_split_voice(event, song, play, limit, extra_note)
-        except Exception:  # noqa: BLE001 - 分片失败时退回文件发送
-            logger.exception("语音分片失败，改用音频文件发送")
+        except Exception as exc:  # noqa: BLE001 - 分片失败时退回单段语音/文件
+            logger.exception("语音分片失败，改用单段语音或音频文件")
             play["_voice_split_failed"] = True
+            play["_voice_split_error"] = str(exc)[:200]
             return None
 
     async def _send_split_voice(
@@ -1418,6 +1468,9 @@ class LuoyueMusicPlugin(Star):
                     "\n⚠️ 语音分片未完成或超过单段上限，已改为发送音频文件。"
                     "可在配置中调整 voice_max_seconds / voice_split。"
                 )
+                reason = str(play.get("_voice_split_error") or "")
+                if reason:
+                    note += f"\n原因：{reason[:120]}"
 
         components: list = [Comp.Plain(info + note)]
 
