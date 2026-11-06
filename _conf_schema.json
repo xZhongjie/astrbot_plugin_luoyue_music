@@ -1,0 +1,108 @@
+{
+  "api_base": {
+    "description": "落月 API 地址",
+    "type": "string",
+    "default": "https://api.vkeys.cn",
+    "hint": "默认使用官方地址 https://api.vkeys.cn，一般无需修改。也可以填写备用域名 https://api.epdd.cn。"
+  },
+  "default_source": {
+    "description": "默认音源",
+    "type": "string",
+    "default": "tencent",
+    "options": ["tencent", "netease"],
+    "labels": ["QQ 音乐", "网易云音乐"],
+    "hint": "用户也可以通过「/点歌源」在会话内临时切换。当前落月 API 的网易云线路可能取不到播放链接，推荐默认使用 QQ 音乐。"
+  },
+  "search_limit": {
+    "description": "搜索结果数量",
+    "type": "int",
+    "default": 5,
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    },
+    "hint": "每次搜索返回的候选歌曲数量，范围 1-10。"
+  },
+  "quality_netease": {
+    "description": "网易云音质上限",
+    "type": "int",
+    "default": 3,
+    "slider": {
+      "min": 1,
+      "max": 9,
+      "step": 1
+    },
+    "hint": "1=标准 64k，2=标准 128k，3=HQ 192k，4=HQ 320k，5=无损，6=Hi-Res，7=高清臻音，8=沉浸环绕声，9=超清母带。注意：当前落月 API 网易云线路实际只允许 1-3，超出时会自动降级重试。"
+  },
+  "quality_tencent": {
+    "description": "QQ 音乐音质上限",
+    "type": "int",
+    "default": 8,
+    "slider": {
+      "min": 0,
+      "max": 16,
+      "step": 1
+    },
+    "hint": "0=试听，4=标准，8=HQ 高音质，10=无损，11=Hi-Res，14=臻品母带。15、16 为 AI 音轨，不建议使用。"
+  },
+  "send_mode": {
+    "description": "默认发送方式",
+    "type": "string",
+    "default": "auto",
+    "options": ["auto", "card", "link", "record", "file"],
+    "labels": ["自动", "音乐卡片", "播放链接", "语音", "音频文件"],
+    "hint": "自动：OneBot（aiocqhttp / NapCat）平台发音乐卡片，其他平台发播放链接。用户也可以用「/语音点歌 歌名」「/文件点歌 歌名」，或在指令末尾加「语音 / 文件 / 卡片 / 链接」临时覆盖。语音模式需要 AstrBot 所在机器安装 ffmpeg。"
+  },
+  "auto_play_single": {
+    "description": "唯一结果自动播放",
+    "type": "bool",
+    "default": true,
+    "hint": "搜索只命中一首歌时直接播放，不再显示候选列表。"
+  },
+  "voice_max_seconds": {
+    "description": "语音时长上限（秒）",
+    "type": "int",
+    "default": 60,
+    "slider": {
+      "min": 0,
+      "max": 600,
+      "step": 10
+    },
+    "hint": "QQ 语音条通常限制 60 秒。歌曲超过该时长时，语音模式会自动改为发送音频文件。填 0 表示不限制。"
+  },
+  "selection_ttl": {
+    "description": "候选有效期（秒）",
+    "type": "int",
+    "default": 120,
+    "slider": {
+      "min": 15,
+      "max": 600,
+      "step": 15
+    },
+    "hint": "搜索结果在多少秒内可以通过「/点歌 序号」选择。"
+  },
+  "request_timeout": {
+    "description": "接口超时（秒）",
+    "type": "int",
+    "default": 15,
+    "slider": {
+      "min": 5,
+      "max": 60,
+      "step": 1
+    },
+    "hint": "单次请求落月 API 的超时时间。"
+  },
+  "proxy": {
+    "description": "HTTP 代理",
+    "type": "string",
+    "default": "",
+    "hint": "可选。例如 http://127.0.0.1:7890。留空表示直连。"
+  },
+  "show_cover": {
+    "description": "链接模式附带封面",
+    "type": "bool",
+    "default": false,
+    "hint": "使用「播放链接」模式时，额外发送歌曲封面图片。"
+  }
+}
