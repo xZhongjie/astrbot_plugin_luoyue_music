@@ -165,7 +165,7 @@ https://your-meting.example.com/api?server={source}&type=url&id={id}&br={quality
 
 - 支持占位符：`{source}`、`{id}`、`{mid}`、`{quality}`、`{title}`、`{singer}`
 - 插件会在落月 / 免费线路都取不到链接时调用该接口，成功则使用它返回的音频，**不再切 QQ 音乐**
-- 接口可以返回纯文本 URL，也可以返回 `{"url": "..."}` 或 `{"data": {"url": "..."}}`
+- 接口可以返回纯文本 URL、`{"url": "..."}`、`{"data": {"url": "..."}}`；如果接口直接返回音频流（`Content-Type: audio/*`），插件会直接把该接口地址当作播放链接
 - 公共 Meting 实例通常没有会员 Cookie，VIP 歌仍会返回空；需要自建并配置你自己的 Cookie
 
 > 该接口由你自行提供，请确保你有权使用对应账号和服务；插件不内置任何第三方解析地址。

@@ -1190,6 +1190,16 @@ class LuoyueMusicPlugin(Star):
             logger.warning("meting_api 模板占位符不正确")
             return None
 
+        # 不少 Meting 实例的 type=url 会直接返回音频流，此时该地址本身就是播放链接
+        if await self.client._probe_audio(url):
+            return {
+                "url": url,
+                "quality": "Meting 解析",
+                "interval": song.duration,
+                "size": song.size,
+                "link": self._web_link(song),
+            }
+
         try:
             text = (await self.client.fetch_text(url)).strip()
         except LuoyueError as exc:
