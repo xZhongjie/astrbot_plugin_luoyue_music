@@ -25,15 +25,15 @@
     "hint": "每次搜索返回的候选歌曲数量，范围 1-10。"
   },
   "quality_netease": {
-    "description": "网易云音质上限",
+    "description": "网易云音质",
     "type": "int",
     "default": 2,
     "slider": {
       "min": 1,
-      "max": 9,
+      "max": 2,
       "step": 1
     },
-    "hint": "1=标准 64k，2=标准 128k，3=HQ 192k。数值越高越容易被 VIP 限制，建议保持 2；接口只允许 1-3，超出会自动降级，取不到链接时还会再降到 64k 重试。"
+    "hint": "1=标准 64k，2=标准 128k（免费可听的最高音质）。插件会直接按该音质请求，不再尝试 HQ / 无损等需要 VIP 的音质。"
   },
   "quality_tencent": {
     "description": "QQ 音乐音质上限",
@@ -67,13 +67,13 @@
     "hint": "当前音源取不到播放链接时（例如网易云线路异常、VIP 歌曲），自动到另一音源搜索同名歌曲并播放。"
   },
   "netease_outer_fallback": {
-    "description": "网易云标准音质备用线路",
+    "description": "网易云免费线路优先",
     "type": "bool",
     "default": true,
-    "hint": "网易云取不到链接时，尝试官方 song/media/outer 标准音质线路（无需登录，免费歌曲可用）。会先探测是否为真实音频，避免发出 404 页面。"
+    "hint": "网易云点歌时优先使用官方 song/media/outer 标准音质免费线路（128k），免费歌曲可直接播放，不会再去请求高音质或切换 QQ 音乐。"
   },
   "voice_max_seconds": {
-    "description": "语音时长上限（秒）",
+    "description": "单段语音最长时长（秒）",
     "type": "int",
     "default": 60,
     "slider": {
@@ -81,7 +81,13 @@
       "max": 600,
       "step": 10
     },
-    "hint": "QQ 语音条通常限制 60 秒。歌曲超过该时长时，语音模式会自动改为发送音频文件。填 0 表示不限制。"
+    "hint": "歌曲超过该时长时会自动分片发送，而不是改发文件。QQ 语音条通常限制 60 秒，建议保持 60。填 0 表示不分片。"
+  },
+  "voice_split": {
+    "description": "语音自动分片",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，超过单段时长的歌曲会用 ffmpeg 切成多段语音依次发送；关闭则超过时长时改发音频文件。"
   },
   "selection_ttl": {
     "description": "候选有效期（秒）",

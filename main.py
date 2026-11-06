@@ -13,12 +13,14 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import re
 import shutil
+import tempfile
 import time
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
 import aiohttp
@@ -119,6 +121,23 @@ def _is_connection_error(exc: Exception) -> bool:
     """判断是否为网络层错误（此时继续重试其它音质/关键词没有意义）。"""
     text = str(exc)
     return "无法连接落月 API" in text or "无法解析的数据" in text
+
+
+def _stop_ai_reply(handler):
+    """命令处理结束后阻止事件继续进入 AstrBot 默认的 LLM 链路。
+
+    指令插件通常只希望返回自己的结果，不希望再让 AI 回复一遍。
+    """
+
+    @functools.wraps(handler)
+    async def wrapper(self, event):
+        try:
+            async for result in handler(self, event):
+                yield result
+        finally:
+            event.stop_event()
+
+    return wrapper
 
 
 @dataclass
@@ -344,8 +363,8 @@ class LuoyueClient:
         QQ 音乐在 id 失败时再尝试 mid；网易云 id 失败时再尝试 choose 模式。
         """
         if song.source == "netease":
-            # 当前接口只允许 1-3，配置更高时先按 3 处理，再降级重试
-            quality = min(max(quality, 1), 3)
+            # 免费可听的最高音质是标准 128k（2），再高需要 VIP，直接按 2 请求
+            quality = min(max(quality, 1), 2)
             qualities = [quality]
             if quality > 1:
                 qualities.append(1)
@@ -434,12 +453,30 @@ class LuoyueClient:
             return None
         return {
             "url": url,
-            "quality": "标准音质（官方备用线路）",
+            "quality": "标准音质（免费线路 128k）",
             "interval": song.duration,
             "size": song.size,
             "link": f"https://music.163.com/#/song?id={song.song_id}",
             "_force_custom_card": True,
         }
+
+    async def download(self, url: str, dest: Path) -> None:
+        """把音频下载到本地文件（用于语音分片）。"""
+        session = await self._get_session()
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=60)
+        try:
+            async with session.get(
+                url,
+                proxy=self.proxy or None,
+                timeout=timeout,
+            ) as response:
+                if response.status != 200:
+                    raise LuoyueError(f"音频下载失败（HTTP {response.status}）")
+                with dest.open("wb") as file:
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        file.write(chunk)
+        except (TimeoutError, aiohttp.ClientError) as exc:
+            raise LuoyueError(f"音频下载失败：{exc}") from exc
 
 
 def _build_music_card(song: Song, audio_url: str, force_custom: bool = False):
@@ -583,6 +620,7 @@ class LuoyueMusicPlugin(Star):
         self._sessions: dict[str, SearchSession] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._source_cache: dict[str, str] = {}
+        self._outer_blocked_until = 0.0
         logger.info(
             "落月点歌插件已加载，注册指令：点歌 / 选歌 / 直接点歌 / "
             "语音点歌 / 文件点歌 / 点歌源 / 点歌帮助"
@@ -611,7 +649,7 @@ class LuoyueMusicPlugin(Star):
                 _config_value(self.config, "quality_netease", 2),
                 2,
             )
-            return min(9, max(1, value))
+            return min(2, max(1, value))
         value = _as_int(_config_value(self.config, "quality_tencent", 8), 8)
         return min(16, max(0, value))
 
@@ -632,6 +670,9 @@ class LuoyueMusicPlugin(Star):
             0,
             _as_int(_config_value(self.config, "voice_max_seconds", 60), 60),
         )
+
+    def _voice_split(self) -> bool:
+        return bool(_config_value(self.config, "voice_split", True))
 
     def _send_mode(
         self,
@@ -744,6 +785,7 @@ class LuoyueMusicPlugin(Star):
     # 指令
     # ------------------------------------------------------------------
     @filter.command("点歌", alias={"落月点歌"})
+    @_stop_ai_reply
     async def cmd_request(self, event: AstrMessageEvent):
         """点歌：/点歌 歌名 搜索，/点歌 序号 选择候选。"""
         keyword, mode = self._split_mode(
@@ -754,12 +796,17 @@ class LuoyueMusicPlugin(Star):
             return
 
         if keyword.isdigit():
-            yield event.chain_result(await self._select_song(event, int(keyword), mode))
+            components = await self._select_song(event, int(keyword), mode)
+            if components:
+                yield event.chain_result(components)
             return
 
-        yield event.chain_result(await self._search(event, keyword, mode=mode))
+        components = await self._search(event, keyword, mode=mode)
+        if components:
+            yield event.chain_result(components)
 
     @filter.command("选歌", alias={"选"})
+    @_stop_ai_reply
     async def cmd_select(self, event: AstrMessageEvent):
         """选择搜索候选中的歌曲：/选歌 序号 [语音|文件|卡片|链接]。"""
         args, mode = self._split_mode(self._extract_args(event, ("选歌", "选")))
@@ -769,9 +816,12 @@ class LuoyueMusicPlugin(Star):
                 "请先发送「/点歌 歌名」获取候选列表。"
             )
             return
-        yield event.chain_result(await self._select_song(event, int(args), mode))
+        components = await self._select_song(event, int(args), mode)
+        if components:
+            yield event.chain_result(components)
 
     @filter.command("直接点歌", alias={"点播", "来一首"})
+    @_stop_ai_reply
     async def cmd_play_direct(self, event: AstrMessageEvent):
         """直接播放搜索结果第一首：/直接点歌 歌名 [语音|文件]。"""
         keyword, mode = self._split_mode(
@@ -782,11 +832,12 @@ class LuoyueMusicPlugin(Star):
                 "用法：/直接点歌 歌名 [语音|文件]\n示例：/直接点歌 晴天"
             )
             return
-        yield event.chain_result(
-            await self._search(event, keyword, direct=True, mode=mode)
-        )
+        components = await self._search(event, keyword, direct=True, mode=mode)
+        if components:
+            yield event.chain_result(components)
 
     @filter.command("语音点歌", alias={"语音点播"})
+    @_stop_ai_reply
     async def cmd_voice(self, event: AstrMessageEvent):
         """直接以语音条发送：/语音点歌 歌名。"""
         keyword = self._extract_args(event, ("语音点歌", "语音点播"))
@@ -796,22 +847,24 @@ class LuoyueMusicPlugin(Star):
                 "注意：语音模式需要 AstrBot 所在机器安装 ffmpeg。"
             )
             return
-        yield event.chain_result(
-            await self._search(event, keyword, direct=True, mode="record")
-        )
+        components = await self._search(event, keyword, direct=True, mode="record")
+        if components:
+            yield event.chain_result(components)
 
     @filter.command("文件点歌", alias={"文件点播"})
+    @_stop_ai_reply
     async def cmd_file(self, event: AstrMessageEvent):
         """直接以音频文件发送：/文件点歌 歌名。"""
         keyword = self._extract_args(event, ("文件点歌", "文件点播"))
         if not keyword:
             yield event.plain_result("用法：/文件点歌 歌名\n示例：/文件点歌 晴天")
             return
-        yield event.chain_result(
-            await self._search(event, keyword, direct=True, mode="file")
-        )
+        components = await self._search(event, keyword, direct=True, mode="file")
+        if components:
+            yield event.chain_result(components)
 
     @filter.command("点歌源", alias={"音源"})
+    @_stop_ai_reply
     async def cmd_source(self, event: AstrMessageEvent):
         """查看或切换音源：/点歌源 网易云|QQ音乐。"""
         args = self._extract_args(event, ("点歌源", "音源"))
@@ -837,6 +890,7 @@ class LuoyueMusicPlugin(Star):
         yield event.plain_result(f"✅ 已切换音源为：{SOURCE_LABELS[target]}")
 
     @filter.command("点歌帮助", alias={"点歌菜单", "点歌说明"})
+    @_stop_ai_reply
     async def cmd_help(self, event: AstrMessageEvent):
         """显示点歌帮助。"""
         yield event.plain_result(HELP_TEXT)
@@ -915,6 +969,31 @@ class LuoyueMusicPlugin(Star):
         lock = self._locks.setdefault(key, asyncio.Lock())
 
         async with lock:
+            # 网易云优先使用官方免费线路（标准 128k），避免先请求高音质再兜底
+            if (
+                song.source == "netease"
+                and self._netease_outer_fallback()
+                and time.time() >= self._outer_blocked_until
+                and hasattr(self.client, "netease_outer")
+            ):
+                outer = await self.client.netease_outer(song)
+                if outer:
+                    self._sessions.pop(key, None)
+                    components = await self._maybe_send_split_voice(
+                        event, song, outer, mode
+                    )
+                    if components is not None:
+                        return components
+                    return self._build_play_chain(
+                        event,
+                        song,
+                        outer,
+                        mode,
+                        "🎧 已直接使用网易云标准音质免费线路（128k）。\n",
+                    )
+                # 免费线路被风控/失败后，10 分钟内不再反复探测
+                self._outer_blocked_until = time.time() + 600
+
             try:
                 play = await self.client.play(song, self._quality(song.source))
             except LuoyueError as exc:
@@ -928,6 +1007,9 @@ class LuoyueMusicPlugin(Star):
                 return [Comp.Plain("❌ 播放失败：插件内部错误，请查看 AstrBot 日志。")]
 
             self._sessions.pop(key, None)
+            components = await self._maybe_send_split_voice(event, song, play, mode)
+            if components is not None:
+                return components
             return self._build_play_chain(event, song, play, mode)
 
     async def _fallback_play(
@@ -941,17 +1023,6 @@ class LuoyueMusicPlugin(Star):
 
         返回 ``(消息组件, 是否成功)``。
         """
-        # 网易云优先尝试官方标准音质备用线路（免费歌曲可用，不依赖登录）
-        if (
-            song.source == "netease"
-            and self._netease_outer_fallback()
-            and hasattr(self.client, "netease_outer")
-        ):
-            outer = await self.client.netease_outer(song)
-            if outer:
-                note = "🎧 网易云接口未返回链接，已改用官方标准音质备用线路。\n"
-                return self._build_play_chain(event, song, outer, mode, note), True
-
         if not self._auto_source_fallback():
             return self._play_error_chain(song, error), False
 
@@ -1053,6 +1124,142 @@ class LuoyueMusicPlugin(Star):
         )
         return [Comp.Plain("\n".join(lines))]
 
+    async def _maybe_send_split_voice(
+        self,
+        event: AstrMessageEvent,
+        song: Song,
+        play: dict,
+        mode: str | None = None,
+    ) -> list | None:
+        """语音超过单段上限时，下载并分片发送。返回 ``[]`` 表示已发送。"""
+        if self._send_mode(event, mode) != "record":
+            return None
+
+        limit = self._voice_max_seconds()
+        if limit <= 0 or not self._voice_split():
+            return None
+        if shutil.which("ffmpeg") is None:
+            return None
+
+        audio_url = str(play.get("url") or "").strip()
+        if not audio_url:
+            return None
+
+        duration = _parse_duration(str(play.get("interval") or song.duration or ""))
+        if duration is None:
+            duration = await self._probe_audio_duration(audio_url)
+        if duration is None or duration <= limit:
+            return None
+
+        try:
+            return await self._send_split_voice(event, song, play, limit)
+        except Exception:  # noqa: BLE001 - 分片失败时退回文件发送
+            logger.exception("语音分片失败，改用音频文件发送")
+            play["_voice_split_failed"] = True
+            return None
+
+    async def _send_split_voice(
+        self,
+        event: AstrMessageEvent,
+        song: Song,
+        play: dict,
+        limit: int,
+    ) -> list:
+        work_dir = Path(tempfile.mkdtemp(prefix="astrbot_luoyue_voice_"))
+        try:
+            source = work_dir / "source"
+            await self.client.download(str(play["url"]), source)
+            chunks = await self._split_audio(source, limit, work_dir)
+            if not chunks:
+                raise RuntimeError("没有生成任何语音分片")
+
+            total = len(chunks)
+            header = (
+                format_play_info(song, play)
+                + f"\n🎤 已按 {limit} 秒分片，共 {total} 段。"
+            )
+            for index, chunk in enumerate(chunks, 1):
+                components: list = []
+                if index == 1:
+                    components.append(Comp.Plain(header))
+                else:
+                    components.append(Comp.Plain(f"第 {index}/{total} 段"))
+                components.append(Comp.Record(file=str(chunk), url=str(chunk)))
+                await event.send(event.chain_result(components))
+                await asyncio.sleep(0.5)
+            return []
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    async def _split_audio(
+        self,
+        source: Path,
+        seconds: int,
+        work_dir: Path,
+    ) -> list[Path]:
+        out_dir = work_dir / "chunks"
+        out_dir.mkdir()
+        ffmpeg = shutil.which("ffmpeg")
+        pattern = str(out_dir / "part_%03d.wav")
+        command = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(source),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            "-f",
+            "segment",
+            "-segment_time",
+            str(seconds),
+            "-reset_timestamps",
+            "1",
+            pattern,
+        ]
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await process.communicate()
+        if process.returncode != 0:
+            raise RuntimeError(stderr.decode("utf-8", "replace")[-400:])
+        return sorted(out_dir.glob("part_*.wav"))
+
+    async def _probe_audio_duration(self, url: str) -> int | None:
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            return None
+        command = [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            url,
+        ]
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await process.communicate()
+            value = stdout.decode("utf-8", "replace").strip()
+            return int(float(value))
+        except (ValueError, OSError):
+            return None
+
     def _build_play_chain(
         self,
         event: AstrMessageEvent,
@@ -1073,24 +1280,27 @@ class LuoyueMusicPlugin(Star):
 
         if mode == "record" and shutil.which("ffmpeg") is None:
             # AstrBot 发送语音前会将音频转码为 wav，缺少 ffmpeg 会直接失败
-            logger.warning("未检测到 ffmpeg，语音模式自动降级为播放链接")
-            mode = "link"
+            logger.warning("未检测到 ffmpeg，语音模式改为音频文件发送")
+            mode = "file"
             note = (
-                "\n⚠️ 未检测到 ffmpeg，语音发送已自动降级为播放链接。"
+                "\n⚠️ 未检测到 ffmpeg，语音发送已改为音频文件。"
                 "安装 ffmpeg 后即可正常发送语音。"
             )
 
         if mode == "record":
             limit = self._voice_max_seconds()
             seconds = _parse_duration(str(play.get("interval") or song.duration or ""))
-            if limit > 0 and seconds is not None and seconds > limit:
+            over_limit = limit > 0 and seconds is not None and seconds > limit
+            if play.get("_voice_split_failed") or over_limit:
                 logger.info(
-                    "歌曲时长 %s 秒超过语音上限 %s 秒，改为文件发送", seconds, limit
+                    "语音分片未完成（时长 %s 秒，单段上限 %s 秒），改为文件发送",
+                    seconds,
+                    limit,
                 )
                 mode = "file"
                 note = (
-                    f"\n⚠️ 歌曲时长超过语音上限 {limit} 秒，已改为发送音频文件。"
-                    "可在插件配置中调整 voice_max_seconds（0 表示不限制）。"
+                    "\n⚠️ 语音分片未完成或超过单段上限，已改为发送音频文件。"
+                    "可在配置中调整 voice_max_seconds / voice_split。"
                 )
 
         components: list = [Comp.Plain(info + note)]
