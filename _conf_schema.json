@@ -60,6 +60,12 @@
     "default": true,
     "hint": "搜索只命中一首歌时直接播放，不再显示候选列表。"
   },
+  "auto_source_fallback": {
+    "description": "跨音源自动兜底",
+    "type": "bool",
+    "default": true,
+    "hint": "当前音源取不到播放链接时（例如网易云线路异常、VIP 歌曲），自动到另一音源搜索同名歌曲并播放。"
+  },
   "voice_max_seconds": {
     "description": "语音时长上限（秒）",
     "type": "int",

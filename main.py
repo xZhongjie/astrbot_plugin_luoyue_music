@@ -550,6 +550,9 @@ class LuoyueMusicPlugin(Star):
     def _auto_play_single(self) -> bool:
         return bool(_config_value(self.config, "auto_play_single", True))
 
+    def _auto_source_fallback(self) -> bool:
+        return bool(_config_value(self.config, "auto_source_fallback", True))
+
     def _show_cover(self) -> bool:
         return bool(_config_value(self.config, "show_cover", False))
 
@@ -845,7 +848,10 @@ class LuoyueMusicPlugin(Star):
                 play = await self.client.play(song, self._quality(song.source))
             except LuoyueError as exc:
                 logger.warning("获取歌曲播放链接失败：%s", exc)
-                return [Comp.Plain(f"❌ 播放失败：{exc}")]
+                components, ok = await self._fallback_play(event, song, mode, exc)
+                if ok:
+                    self._sessions.pop(key, None)
+                return components
             except Exception:  # noqa: BLE001 - 插件兜底，避免中断消息处理
                 logger.exception("获取歌曲播放链接时发生未预期错误")
                 return [Comp.Plain("❌ 播放失败：插件内部错误，请查看 AstrBot 日志。")]
@@ -853,18 +859,114 @@ class LuoyueMusicPlugin(Star):
             self._sessions.pop(key, None)
             return self._build_play_chain(event, song, play, mode)
 
+    async def _fallback_play(
+        self,
+        event: AstrMessageEvent,
+        song: Song,
+        mode: str | None,
+        error: Exception,
+    ) -> tuple[list, bool]:
+        """当前音源取不到链接时，自动到另一音源搜索同名歌曲。
+
+        返回 ``(消息组件, 是否成功)``。
+        """
+        if not self._auto_source_fallback():
+            return self._play_error_chain(song, error), False
+
+        other = "tencent" if song.source == "netease" else "netease"
+        keyword = f"{song.title} {song.singer}".strip()
+        candidates: list[Song] = []
+        try:
+            candidates = await self.client.search(
+                other,
+                keyword,
+                self._limit(),
+                self._quality(other),
+            )
+        except Exception:  # noqa: BLE001 - 兜底流程失败时退回错误提示
+            logger.warning("跨音源搜索失败：%s %s", other, keyword)
+
+        candidate = self._pick_similar(song, candidates)
+        if candidate is not None:
+            try:
+                play = await self.client.play(candidate, self._quality(other))
+            except LuoyueError as exc:
+                logger.warning("跨音源取链失败：%s", exc)
+            else:
+                note = (
+                    f"🔁 {SOURCE_LABELS[song.source]}暂无可用播放链接，"
+                    f"已自动切换到 {SOURCE_LABELS[other]}。\n"
+                )
+                return (
+                    self._build_play_chain(event, candidate, play, mode, note),
+                    True,
+                )
+
+        return self._play_error_chain(song, error), False
+
+    @staticmethod
+    def _pick_similar(song: Song, candidates: list[Song]) -> Song | None:
+        """从另一音源的搜索结果中挑出与目标最接近的一首。"""
+        if not candidates:
+            return None
+
+        def normalize(value: str) -> str:
+            return re.sub(r"[\s\-_/·・]+", "", value or "").lower()
+
+        target_title = normalize(song.title)
+        target_singer = normalize(song.singer)
+
+        for candidate in candidates:
+            if normalize(candidate.title) == target_title:
+                return candidate
+
+        for candidate in candidates:
+            title = normalize(candidate.title)
+            if target_title and (target_title in title or title in target_title):
+                return candidate
+
+        for candidate in candidates:
+            if target_singer and normalize(candidate.singer) == target_singer:
+                return candidate
+
+        return candidates[0]
+
+    @staticmethod
+    def _web_link(song: Song) -> str:
+        """没有可用播放链接时，构造歌曲播放页地址。"""
+        if song.link:
+            return song.link
+        if song.source == "netease" and song.song_id:
+            return f"https://music.163.com/#/song?id={song.song_id}"
+        if song.source == "tencent":
+            mid = song.mid or song.song_id
+            if mid:
+                return f"https://i.y.qq.com/v8/playsong.html?songmid={mid}&type=0"
+        return ""
+
+    def _play_error_chain(self, song: Song, error: Exception) -> list:
+        lines = [f"❌ 播放失败：{error}"]
+        link = self._web_link(song)
+        if link:
+            lines.append(f"🔗 播放页：{link}")
+        lines.append(
+            "💡 可以试试切换音源（/点歌源 网易云 或 /点歌源 QQ音乐），或换一首歌。"
+        )
+        return [Comp.Plain("\n".join(lines))]
+
     def _build_play_chain(
         self,
         event: AstrMessageEvent,
         song: Song,
         play: dict,
         mode: str | None = None,
+        extra_note: str = "",
     ) -> list:
         audio_url = str(play.get("url") or "").strip()
         if not audio_url:
             return [Comp.Plain("❌ 接口返回的播放链接为空，请稍后再试。")]
 
-        info = format_play_info(song, play)
+        info = extra_note + format_play_info(song, play)
         mode = self._send_mode(event, mode)
         note = ""
 
