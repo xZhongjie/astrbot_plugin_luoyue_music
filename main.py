@@ -1084,6 +1084,11 @@ class LuoyueMusicPlugin(Star):
                     f"🔁 {SOURCE_LABELS[song.source]}暂无可用播放链接，"
                     f"已自动切换到 {SOURCE_LABELS[other]}。\n"
                 )
+                components = await self._maybe_send_split_voice(
+                    event, candidate, play, mode, note
+                )
+                if components is not None:
+                    return components, True
                 return (
                     self._build_play_chain(event, candidate, play, mode, note),
                     True,
@@ -1147,6 +1152,7 @@ class LuoyueMusicPlugin(Star):
         song: Song,
         play: dict,
         mode: str | None = None,
+        extra_note: str = "",
     ) -> list | None:
         """语音超过单段上限时，下载并分片发送。返回 ``[]`` 表示已发送。"""
         if self._send_mode(event, mode) != "record":
@@ -1169,7 +1175,9 @@ class LuoyueMusicPlugin(Star):
             return None
 
         try:
-            return await self._send_split_voice(event, song, play, limit)
+            return await self._send_split_voice(
+                event, song, play, limit, extra_note
+            )
         except Exception:  # noqa: BLE001 - 分片失败时退回文件发送
             logger.exception("语音分片失败，改用音频文件发送")
             play["_voice_split_failed"] = True
@@ -1181,6 +1189,7 @@ class LuoyueMusicPlugin(Star):
         song: Song,
         play: dict,
         limit: int,
+        extra_note: str = "",
     ) -> list:
         work_dir = Path(tempfile.mkdtemp(prefix="astrbot_luoyue_voice_"))
         try:
@@ -1192,7 +1201,8 @@ class LuoyueMusicPlugin(Star):
 
             total = len(chunks)
             header = (
-                format_play_info(song, play)
+                extra_note
+                + format_play_info(song, play)
                 + f"\n🎤 已按 {limit} 秒分片，共 {total} 段。"
             )
             for index, chunk in enumerate(chunks, 1):
