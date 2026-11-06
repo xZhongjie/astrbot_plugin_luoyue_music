@@ -115,6 +115,12 @@ def _as_int(value, default: int) -> int:
         return default
 
 
+def _is_connection_error(exc: Exception) -> bool:
+    """判断是否为网络层错误（此时继续重试其它音质/关键词没有意义）。"""
+    text = str(exc)
+    return "无法连接落月 API" in text or "无法解析的数据" in text
+
+
 @dataclass
 class Song:
     """一首歌曲的归一化信息。"""
@@ -347,6 +353,7 @@ class LuoyueClient:
             qualities = [quality]
 
         errors: list[str] = []
+        connection_failed = False
         for quality_value in qualities:
             for params in self._play_attempts(song, quality_value):
                 if not any(params.get(key) for key in ("id", "mid", "choose")):
@@ -355,6 +362,9 @@ class LuoyueClient:
                     body = await self._request(song.source, params)
                 except LuoyueError as exc:
                     errors.append(str(exc))
+                    if _is_connection_error(exc):
+                        connection_failed = True
+                        break
                     continue
 
                 data = body.get("data")
@@ -365,6 +375,8 @@ class LuoyueClient:
                     if url:
                         return data
                 errors.append("接口没有返回播放链接")
+            if connection_failed:
+                break
 
         detail = errors[-1] if errors else "未知错误"
         raise LuoyueError(
@@ -395,7 +407,7 @@ class LuoyueClient:
         """探测 URL 是否真的是音频文件（排除 404 页面等）。"""
         try:
             session = await self._get_session()
-            timeout = aiohttp.ClientTimeout(total=min(self.timeout, 10))
+            timeout = aiohttp.ClientTimeout(total=min(self.timeout, 5))
             async with session.get(
                 url,
                 headers={
@@ -571,6 +583,10 @@ class LuoyueMusicPlugin(Star):
         self._sessions: dict[str, SearchSession] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._source_cache: dict[str, str] = {}
+        logger.info(
+            "落月点歌插件已加载，注册指令：点歌 / 选歌 / 直接点歌 / "
+            "语音点歌 / 文件点歌 / 点歌源 / 点歌帮助"
+        )
 
     async def terminate(self):
         """插件卸载 / 停用时关闭 HTTP 会话。"""
@@ -961,8 +977,10 @@ class LuoyueMusicPlugin(Star):
                     self._limit(),
                     self._quality(other),
                 )
-            except Exception:  # noqa: BLE001 - 兜底流程失败时继续尝试下一种关键词
+            except Exception as exc:  # noqa: BLE001 - 兜底流程失败时继续尝试下一种关键词
                 logger.warning("跨音源搜索失败：%s %s", other, keyword)
+                if _is_connection_error(exc):
+                    break
                 continue
             if candidates:
                 break
