@@ -334,8 +334,46 @@ class LuoyueClient:
     async def play(self, song: Song, quality: int) -> dict:
         """获取歌曲播放信息。
 
-        优先用歌曲 id 换取播放地址；QQ 音乐在 id 失败时再尝试 mid。
+        网易云会先按配置音质请求，再降到标准音质重试，避免线路只提供低音质；
+        QQ 音乐在 id 失败时再尝试 mid；网易云 id 失败时再尝试 choose 模式。
         """
+        if song.source == "netease":
+            # 当前接口只允许 1-3，配置更高时先按 3 处理，再降级重试
+            quality = min(max(quality, 1), 3)
+            qualities = [quality]
+            if quality > 1:
+                qualities.append(1)
+        else:
+            qualities = [quality]
+
+        errors: list[str] = []
+        for quality_value in qualities:
+            for params in self._play_attempts(song, quality_value):
+                if not any(params.get(key) for key in ("id", "mid", "choose")):
+                    continue
+                try:
+                    body = await self._request(song.source, params)
+                except LuoyueError as exc:
+                    errors.append(str(exc))
+                    continue
+
+                data = body.get("data")
+                if isinstance(data, list) and data:
+                    data = data[0]
+                if isinstance(data, dict):
+                    url = str(data.get("url") or "").strip()
+                    if url:
+                        return data
+                errors.append("接口没有返回播放链接")
+
+        detail = errors[-1] if errors else "未知错误"
+        raise LuoyueError(
+            f"该歌曲暂时没有可用的播放链接（可能受版权 / VIP 限制）：{detail}"
+        )
+
+    @staticmethod
+    def _play_attempts(song: Song, quality: int) -> list[dict]:
+        """构造同一音质下的多种取链请求参数。"""
         attempts: list[dict] = [{"id": song.song_id, "quality": quality}]
         if song.source == "tencent":
             attempts[0]["type"] = song.song_type
@@ -344,7 +382,6 @@ class LuoyueClient:
                     {"mid": song.mid, "quality": quality, "type": song.song_type}
                 )
         elif song.source == "netease" and song.keyword and song.index:
-            # 部分网易云歌曲用 id 取不到链接，尝试官方文档推荐的 choose 模式
             attempts.append(
                 {
                     "word": song.keyword,
@@ -352,33 +389,48 @@ class LuoyueClient:
                     "quality": quality,
                 }
             )
+        return attempts
 
-        errors: list[str] = []
-        for params in attempts:
-            if not any(params.get(key) for key in ("id", "mid", "choose")):
-                continue
-            try:
-                body = await self._request(song.source, params)
-            except LuoyueError as exc:
-                errors.append(str(exc))
-                continue
+    async def _probe_audio(self, url: str) -> bool:
+        """探测 URL 是否真的是音频文件（排除 404 页面等）。"""
+        try:
+            session = await self._get_session()
+            timeout = aiohttp.ClientTimeout(total=min(self.timeout, 10))
+            async with session.get(
+                url,
+                headers={
+                    "Range": "bytes=0-1",
+                    "User-Agent": "Mozilla/5.0 (compatible; AstrBot)",
+                },
+                allow_redirects=True,
+                timeout=timeout,
+            ) as response:
+                content_type = response.headers.get("Content-Type", "").lower()
+                return response.status in (200, 206) and (
+                    "audio/" in content_type or "octet-stream" in content_type
+                )
+        except (TimeoutError, aiohttp.ClientError):
+            return False
 
-            data = body.get("data")
-            if isinstance(data, list) and data:
-                data = data[0]
-            if isinstance(data, dict):
-                url = str(data.get("url") or "").strip()
-                if url:
-                    return data
-            errors.append("接口没有返回播放链接")
+    async def netease_outer(self, song: Song) -> dict | None:
+        """网易云官方标准音质备用线路（无需登录，免费歌曲可用）。"""
+        if song.source != "netease" or not song.song_id.isdigit():
+            return None
 
-        detail = errors[-1] if errors else "未知错误"
-        raise LuoyueError(
-            f"该歌曲暂时没有可用的播放链接（可能受版权 / VIP 限制）：{detail}"
-        )
+        url = f"https://music.163.com/song/media/outer/url?id={song.song_id}.mp3"
+        if not await self._probe_audio(url):
+            return None
+        return {
+            "url": url,
+            "quality": "标准音质（官方备用线路）",
+            "interval": song.duration,
+            "size": song.size,
+            "link": f"https://music.163.com/#/song?id={song.song_id}",
+            "_force_custom_card": True,
+        }
 
 
-def _build_music_card(song: Song, audio_url: str):
+def _build_music_card(song: Song, audio_url: str, force_custom: bool = False):
     """构造 OneBot 音乐卡片组件。
 
     说明：AstrBot 的 ``Comp.Music`` 使用 pydantic 模型，字段 ``_type`` 以下划线
@@ -391,13 +443,13 @@ def _build_music_card(song: Song, audio_url: str):
     card = Comp.Music()
 
     # 网易云：原生 163 音乐卡片，只需要歌曲 id
-    if song.source == "netease" and song.song_id.isdigit():
+    if not force_custom and song.source == "netease" and song.song_id.isdigit():
         object.__setattr__(card, "id", int(song.song_id))
         object.__setattr__(card, "_type", "163")
         return card
 
     # QQ 音乐：原生 qq 音乐卡片，需要 songmid
-    if song.source == "tencent" and song.mid:
+    if not force_custom and song.source == "tencent" and song.mid:
         object.__setattr__(card, "id", song.mid)
         object.__setattr__(card, "_type", "qq")
         return card
@@ -540,8 +592,8 @@ class LuoyueMusicPlugin(Star):
     def _quality(self, source: str) -> int:
         if source == "netease":
             value = _as_int(
-                _config_value(self.config, "quality_netease", 3),
-                3,
+                _config_value(self.config, "quality_netease", 2),
+                2,
             )
             return min(9, max(1, value))
         value = _as_int(_config_value(self.config, "quality_tencent", 8), 8)
@@ -552,6 +604,9 @@ class LuoyueMusicPlugin(Star):
 
     def _auto_source_fallback(self) -> bool:
         return bool(_config_value(self.config, "auto_source_fallback", True))
+
+    def _netease_outer_fallback(self) -> bool:
+        return bool(_config_value(self.config, "netease_outer_fallback", True))
 
     def _show_cover(self) -> bool:
         return bool(_config_value(self.config, "show_cover", False))
@@ -870,6 +925,17 @@ class LuoyueMusicPlugin(Star):
 
         返回 ``(消息组件, 是否成功)``。
         """
+        # 网易云优先尝试官方标准音质备用线路（免费歌曲可用，不依赖登录）
+        if (
+            song.source == "netease"
+            and self._netease_outer_fallback()
+            and hasattr(self.client, "netease_outer")
+        ):
+            outer = await self.client.netease_outer(song)
+            if outer:
+                note = "🎧 网易云接口未返回链接，已改用官方标准音质备用线路。\n"
+                return self._build_play_chain(event, song, outer, mode, note), True
+
         if not self._auto_source_fallback():
             return self._play_error_chain(song, error), False
 
@@ -982,6 +1048,8 @@ class LuoyueMusicPlugin(Star):
             return [Comp.Plain("❌ 接口返回的播放链接为空，请稍后再试。")]
 
         info = extra_note + format_play_info(song, play)
+        if not song.link:
+            song.link = str(play.get("link") or "")
         mode = self._send_mode(event, mode)
         note = ""
 
@@ -1010,7 +1078,11 @@ class LuoyueMusicPlugin(Star):
         components: list = [Comp.Plain(info + note)]
 
         if mode == "card":
-            card = _build_music_card(song, audio_url)
+            card = _build_music_card(
+                song,
+                audio_url,
+                force_custom=bool(play.get("_force_custom_card")),
+            )
             if card is not None:
                 components.append(card)
             else:
